@@ -21,22 +21,22 @@ On a fresh Arch install: `sudo pacman -S python-gobject gtk4 libadwaita`.
 The CLI goes in `~/.local/bin/proton-drive` (from proton.me/download/drive/cli, check the SHA-512).
 Sign in once with `proton-drive auth login`. The session stays in the GNOME keyring.
 
-## Run
+## Install and run
 
 ```
-~/Projects/proton-drive-browser/drive-browser
+git clone https://github.com/Blackthoarne/proton-drive-browser.git
+cd proton-drive-browser
+./install.sh
 ```
 
-To add it to the app launcher (Super+Space):
-
-```
-cp ~/Projects/proton-drive-browser/drive-browser.desktop ~/.local/share/applications/
-```
+`install.sh` links `drive-browser` into `~/.local/bin` and adds a launcher entry
+(Super+Space on Omarchy) that points at your clone. Run it again if you move the folder.
+Then start it from the launcher, or run `drive-browser`.
 
 ## Test
 
 ```
-python3 -I ~/Projects/proton-drive-browser/dev/test_app.py
+python3 -I dev/test_app.py
 ```
 
 The test stops at once if it would use the real CLI.
