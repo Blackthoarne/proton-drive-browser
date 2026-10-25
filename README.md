@@ -30,7 +30,7 @@ cd proton-drive-browser
 ```
 
 `install.sh` links `drive-browser` into `~/.local/bin` and adds a launcher entry
-(Super+Space on Omarchy) that points at your clone. Run it again if you move the folder.
+(the Apps menu, Super+Alt+Space on Omarchy) that points at your clone. Run it again if you move the folder.
 Then start it from the launcher, or run `drive-browser`.
 
 ## Test
