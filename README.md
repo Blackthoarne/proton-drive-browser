@@ -58,3 +58,7 @@ The test stops at once if it would use the real CLI.
 - The CLI cannot open folders inside Trash or list Devices in detail.
 - No starring, recent files or thumbnails in the list.
 - No sync and no mount: this is a browser, not a sync client.
+
+## License
+
+MIT. See `LICENSE`.
