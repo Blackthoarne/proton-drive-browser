@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Drive Browser
+Comment=Browse, upload and download Proton Drive files
+Exec=/home/tex/Projects/proton-drive-browser/drive-browser
+Icon=folder-remote
+Terminal=false
+Categories=Utility;FileManager;
+StartupWMClass=local.DriveBrowser

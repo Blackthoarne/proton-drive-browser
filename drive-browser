@@ -1,0 +1,1321 @@
+#!/usr/bin/env python3
+"""Drive Browser: a Nautilus-style window for Proton Drive.
+
+Every Drive operation goes through the Proton Drive CLI (see protondrive_cli.py).
+"""
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import protondrive_cli as cli  # noqa: E402
+
+APP_ID = "local.DriveBrowser"
+SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), "drive-browser", "settings.json")
+OPEN_CACHE = os.path.join(GLib.get_user_cache_dir(), "drive-browser", "open")
+
+SECTIONS = [
+    (cli.MY_FILES, "My Files", "user-home-symbolic"),
+    (cli.SHARED_WITH_ME, "Shared with Me", "folder-publicshare-symbolic"),
+    (cli.DEVICES, "Devices", "computer-symbolic"),
+    (cli.TRASH, "Trash", "user-trash-symbolic"),
+]
+SECTION_TITLES = {path: title for path, title, _ in SECTIONS}
+SECTION_ICONS = {path: icon for path, _, icon in SECTIONS}
+
+CSS = """
+.location-pill {
+    background-color: alpha(currentColor, 0.08);
+    border-radius: 9px;
+    min-height: 34px;
+    padding: 0 2px 0 4px;
+}
+.location-pill button.crumb { padding: 2px 6px; min-height: 26px; font-weight: normal; }
+.location-pill button.crumb.current { font-weight: bold; }
+.location-pill .crumb-separator { opacity: 0.45; }
+columnview.file-list > listview > row { border-radius: 8px; }
+columnview.file-list > listview > row > cell { padding-top: 7px; padding-bottom: 7px; }
+columnview.file-list > listview > row > cell:first-child,
+columnview.file-list > header > button:first-child { padding-left: 24px; }
+columnview.file-list > listview > row > cell:last-child,
+columnview.file-list > header > button:last-child { padding-right: 24px; }
+gridview.file-grid > child { border-radius: 12px; padding: 8px 4px; }
+.cut-item { opacity: 0.5; }
+"""
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(settings, f)
+    except OSError:
+        pass
+
+
+def uses_24h_clock():
+    source = Gio.SettingsSchemaSource.get_default()
+    if source and source.lookup("org.gnome.desktop.interface", True):
+        return Gio.Settings.new("org.gnome.desktop.interface").get_string("clock-format") == "24h"
+    return False
+
+
+def friendly_date(dt):
+    """Relative dates in the style Nautilus uses: "Today, 7:43 PM", "2 days ago", "Last month"."""
+    if dt is None:
+        return ""
+    local = dt.astimezone()
+    now = datetime.now().astimezone()
+    days = (now.date() - local.date()).days
+    clock = local.strftime("%H:%M" if uses_24h_clock() else "%-I:%M %p")
+    if days <= 0:
+        return f"Today, {clock}"
+    if days == 1:
+        return f"Yesterday, {clock}"
+    if days < 7:
+        return f"{days} days ago"
+    if days < 14:
+        return "Last week"
+    if days < 30:
+        return f"{days // 7} weeks ago"
+    months = (now.year - local.year) * 12 + now.month - local.month
+    if months <= 1:
+        return "Last month"
+    if months < 12:
+        return f"{months} months ago"
+    years = now.year - local.year
+    return "Last year" if years <= 1 else f"{years} years ago"
+
+
+def node_icon(node):
+    if node.is_folder:
+        return Gio.ThemedIcon.new("folder")
+    content_type = Gio.content_type_from_mime_type(node.media_type) if node.media_type else None
+    if not content_type:
+        content_type, _ = Gio.content_type_guess(node.name, None)
+    return Gio.content_type_get_icon(content_type)
+
+
+def count_label(count, noun="item"):
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def items_label(nodes):
+    return f"“{nodes[0].name}”" if len(nodes) == 1 else count_label(len(nodes))
+
+
+def valid_name(name):
+    name = name.strip()
+    return bool(name) and name not in (".", "..") and "/" not in name
+
+
+def terminal_launcher():
+    return shutil.which("xdg-terminal-exec")
+
+
+@dataclass(frozen=True)
+class Location:
+    section: str
+    crumbs: tuple = ()  # (name, uid or None) for each folder below the section
+
+    @property
+    def title(self):
+        return self.crumbs[-1][0] if self.crumbs else SECTION_TITLES[self.section]
+
+    def listing_path(self):
+        if self.crumbs and self.crumbs[-1][1]:
+            return f"{self.section}/{self.crumbs[-1][1]}"
+        return self.section + "".join("/" + cli.escape_name(name) for name, _ in self.crumbs)
+
+    def display_path(self):
+        return self.section + "".join("/" + name for name, _ in self.crumbs)
+
+    def child(self, node):
+        return Location(self.section, self.crumbs + ((node.name, node.uid),))
+
+    def parent(self):
+        return Location(self.section, self.crumbs[:-1]) if self.crumbs else None
+
+    @property
+    def writable(self):
+        # The CLI creates and uploads only inside My Files, a device folder or a shared folder.
+        if self.section == cli.MY_FILES:
+            return True
+        return self.section in (cli.SHARED_WITH_ME, cli.DEVICES) and bool(self.crumbs)
+
+    @property
+    def is_trash(self):
+        return self.section == cli.TRASH
+
+
+def parse_location(text):
+    text = text.strip().rstrip("/") or "/"
+    for section, _, _ in SECTIONS:
+        if text == section or text.startswith(section + "/"):
+            names = [part for part in text[len(section):].split("/") if part]
+            return Location(section, tuple((name, None) for name in names))
+    return None
+
+
+class Item(GObject.Object):
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+
+@dataclass
+class Operation:
+    label: str
+    process: object = None
+    row: object = field(default=None, repr=False)
+
+
+# ---------------------------------------------------------------- move dialog
+
+
+class MoveDialog(Adw.Dialog):
+    """Pick a target folder in My Files, browsing with the CLI."""
+
+    def __init__(self, start, exclude_uids, on_chosen):
+        super().__init__(title="Move To", content_width=420, content_height=520)
+        self.exclude_uids = exclude_uids
+        self.on_chosen = on_chosen
+        self.location = start if start.section == cli.MY_FILES else Location(cli.MY_FILES)
+        self.generation = 0
+
+        header = Adw.HeaderBar()
+        self.back_button = Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Parent Folder")
+        self.back_button.connect("clicked", lambda _b: self.go(self.location.parent()))
+        header.pack_start(self.back_button)
+        self.title_label = Gtk.Label(ellipsize=Pango.EllipsizeMode.START, css_classes=["heading"])
+        header.set_title_widget(self.title_label)
+
+        self.listbox = Gtk.ListBox(css_classes=["navigation-sidebar"])
+        self.listbox.connect("row-activated", self._on_row_activated)
+        scrolled = Gtk.ScrolledWindow(child=self.listbox, vexpand=True)
+        self.stack = Gtk.Stack()
+        self.stack.add_named(scrolled, "list")
+        self.stack.add_named(Adw.Spinner(), "loading")
+        self.status = Adw.StatusPage(icon_name="folder-symbolic")
+        self.stack.add_named(self.status, "status")
+
+        self.move_button = Gtk.Button(label="Move Here", css_classes=["suggested-action", "pill"], halign=Gtk.Align.CENTER)
+        self.move_button.connect("clicked", self._on_move)
+        bottom = Gtk.Box(margin_top=12, margin_bottom=12, halign=Gtk.Align.CENTER)
+        bottom.append(self.move_button)
+
+        view = Adw.ToolbarView(content=self.stack)
+        view.add_top_bar(header)
+        view.add_bottom_bar(bottom)
+        self.set_child(view)
+        self.go(self.location)
+
+    def go(self, location):
+        if location is None:
+            return
+        self.location = location
+        self.generation += 1
+        generation = self.generation
+        self.title_label.set_label(location.display_path())
+        self.back_button.set_sensitive(bool(location.crumbs))
+        self.stack.set_visible_child_name("loading")
+
+        def worker():
+            try:
+                result, error = cli.list_folder(location.listing_path(), folders_only=True), None
+            except cli.CliError as e:
+                result, error = None, e
+            GLib.idle_add(self._show, generation, result, error, priority=GLib.PRIORITY_DEFAULT)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show(self, generation, nodes, error):
+        if generation != self.generation:
+            return
+        self.listbox.remove_all()
+        if error:
+            self.status.set_title("Could Not Load Folder")
+            self.status.set_description(GLib.markup_escape_text(error.message))
+            self.stack.set_visible_child_name("status")
+            return
+        folders = sorted((n for n in nodes if n.is_folder and n.uid not in self.exclude_uids), key=lambda n: n.name.casefold())
+        for node in folders:
+            row = Gtk.Box(spacing=10)
+            row.append(Gtk.Image(gicon=node_icon(node), pixel_size=24))
+            row.append(Gtk.Label(label=node.name, xalign=0, ellipsize=Pango.EllipsizeMode.END))
+            list_row = Gtk.ListBoxRow(child=row)
+            list_row.node = node
+            self.listbox.append(list_row)
+        if folders:
+            self.stack.set_visible_child_name("list")
+        else:
+            self.status.set_title("No Folders")
+            self.status.set_description("Move the items here, or go back.")
+            self.stack.set_visible_child_name("status")
+
+    def _on_row_activated(self, _listbox, row):
+        self.go(self.location.child(row.node))
+
+    def _on_move(self, _button):
+        self.close()
+        self.on_chosen(self.location)
+
+
+# ---------------------------------------------------------------- main window
+
+
+class DriveWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Proton Drive", default_width=1000, default_height=700)
+        self.settings = load_settings()
+        self.location = None
+        self.back_stack = []
+        self.forward_stack = []
+        self.generation = 0
+        self.operations = []
+        self.cut_items = None  # (section, [nodes]) waiting for Paste
+        self.syncing_sidebar = False
+        self.last_error = None
+        self.actions = {}
+
+        self._build_models()
+        self._build_ui()
+        self._build_actions()
+        self.connect("close-request", self._on_close_request)
+        self.navigate(Location(cli.MY_FILES))
+
+    # ------------------------------------------------------------ models
+
+    def _build_models(self):
+        self.store = Gio.ListStore(item_type=Item)
+        self.filter = Gtk.CustomFilter.new(self._filter_func, None)
+        self.filter_model = Gtk.FilterListModel(model=self.store, filter=self.filter)
+        self.search_text = ""
+
+        folders_first = Gtk.CustomSorter.new(lambda a, b, _d: self._order(b.node.is_folder, a.node.is_folder), None)
+        self.sorter = Gtk.MultiSorter()
+        self.sorter.append(folders_first)
+        self.sort_model = Gtk.SortListModel(model=self.filter_model, sorter=self.sorter)
+        self.selection = Gtk.MultiSelection(model=self.sort_model)
+        self.selection.connect("selection-changed", lambda *_a: self._update_selection_state())
+        self.selection.connect("items-changed", lambda *_a: self._update_selection_state())
+
+    @staticmethod
+    def _order(a, b):
+        if a < b:
+            return Gtk.Ordering.SMALLER
+        if a > b:
+            return Gtk.Ordering.LARGER
+        return Gtk.Ordering.EQUAL
+
+    def _filter_func(self, item, _data):
+        return not self.search_text or self.search_text in item.node.name.casefold()
+
+    def selected_nodes(self):
+        bitset = self.selection.get_selection()
+        return [self.selection.get_item(bitset.get_nth(i)).node for i in range(bitset.get_size())]
+
+    # ------------------------------------------------------------ UI
+
+    def _build_ui(self):
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.split = Adw.OverlaySplitView(sidebar=self._build_sidebar(), content=self._build_content())
+        flags = GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE
+        self.split.bind_property("show-sidebar", self.sidebar_button, "active", flags)
+        breakpoint = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 700sp"))
+        breakpoint.add_setter(self.split, "collapsed", True)
+        self.add_breakpoint(breakpoint)
+        self.set_content(self.split)
+
+    def _build_sidebar(self):
+        header = Adw.HeaderBar(show_end_title_buttons=False)
+        header.set_title_widget(Adw.WindowTitle(title="Proton Drive"))
+        menu = Gio.Menu()
+        menu.append("Sign In…", "win.sign-in")
+        menu.append("Keyboard Shortcuts", "win.show-shortcuts")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Main Menu"))
+
+        self.sidebar_list = Gtk.ListBox(css_classes=["navigation-sidebar"])
+        for path, title, icon in SECTIONS:
+            box = Gtk.Box(spacing=12, margin_start=6)
+            box.append(Gtk.Image(icon_name=icon))
+            box.append(Gtk.Label(label=title, xalign=0))
+            row = Gtk.ListBoxRow(child=box)
+            row.section = path
+            self.sidebar_list.append(row)
+        self.sidebar_list.connect("row-selected", self._on_sidebar_selected)
+
+        view = Adw.ToolbarView(content=Gtk.ScrolledWindow(child=self.sidebar_list, vexpand=True))
+        view.add_top_bar(header)
+        return view
+
+    def _build_content(self):
+        header = Adw.HeaderBar()
+        self.sidebar_button = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Show Sidebar (F9)")
+        header.pack_start(self.sidebar_button)
+
+        # Title area: location pill, path entry (Ctrl+L) or search entry (Ctrl+F).
+        self.title_stack = Gtk.Stack(hexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.title_stack.add_named(self._build_location_pill(), "pill")
+        self.path_entry = Gtk.Entry(hexpand=True, placeholder_text="/my-files/Folder")
+        self.path_entry.connect("activate", self._on_path_entry_activate)
+        self._add_escape(self.path_entry, self._end_title_edit)
+        self.title_stack.add_named(self.path_entry, "entry")
+        self.search_entry = Gtk.SearchEntry(hexpand=True, placeholder_text="Search current folder")
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("stop-search", lambda _e: self._end_title_edit())
+        self.title_stack.add_named(self.search_entry, "search")
+        header.set_title_widget(self.title_stack)
+
+        self.search_button = Gtk.ToggleButton(icon_name="system-search-symbolic", tooltip_text="Search (Ctrl+F)")
+        self.search_button.connect("toggled", self._on_search_toggled)
+        header.pack_end(self.search_button)
+
+        self.ops_box = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        ops_popover = Gtk.Popover(child=Gtk.Box(margin_top=6, margin_bottom=6, margin_start=6, margin_end=6, width_request=320))
+        ops_popover.get_child().append(self.ops_box)
+        self.ops_button = Gtk.MenuButton(child=Adw.Spinner(), popover=ops_popover, tooltip_text="Transfers", visible=False)
+        header.pack_end(self.ops_button)
+
+        # Content states.
+        self.state_stack = Gtk.Stack(vexpand=True)
+        self.state_stack.add_named(Adw.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32, height_request=32), "loading")
+        self.state_stack.add_named(self._wrap_scroll(self._build_list_view()), "list")
+        self.state_stack.add_named(self._wrap_scroll(self._build_grid_view()), "grid")
+        self.status_page = Adw.StatusPage()
+        self.status_buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        self.status_page.set_child(self.status_buttons)
+        status_menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        status_menu.connect("pressed", self._on_background_menu, self.status_page)
+        self.status_page.add_controller(status_menu)
+        self.state_stack.add_named(self.status_page, "status")
+
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_drop)
+        self.state_stack.add_controller(drop)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_view_key)
+        self.state_stack.add_controller(keys)
+
+        self.toasts = Adw.ToastOverlay(child=self.state_stack)
+        self.context_menu = Gtk.PopoverMenu(has_arrow=False, halign=Gtk.Align.START)
+        self.context_menu.set_parent(self.toasts)
+
+        view = Adw.ToolbarView(content=self.toasts, bottom_bar_style=Adw.ToolbarStyle.FLAT)
+        view.add_top_bar(header)
+        view.add_bottom_bar(self._build_bottom_bar())
+        return view
+
+    def _wrap_scroll(self, view):
+        scrolled = Gtk.ScrolledWindow(child=view, vexpand=True)
+        background = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        background.connect("pressed", self._on_background_menu, scrolled)
+        scrolled.add_controller(background)
+        return scrolled
+
+    def _build_location_pill(self):
+        pill = Gtk.Box(css_classes=["location-pill"], hexpand=True, valign=Gtk.Align.CENTER)
+        self.crumbs_box = Gtk.Box(hexpand=True)
+        pill.append(self.crumbs_box)
+        self.folder_menu_button = Gtk.MenuButton(icon_name="view-more-symbolic", css_classes=["flat", "circular"], tooltip_text="Folder Menu")
+        pill.append(self.folder_menu_button)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_a: self.activate_action("win.location"))
+        self.crumbs_box.add_controller(click)
+        return pill
+
+    def _build_list_view(self):
+        self.column_view = Gtk.ColumnView(model=self.selection, css_classes=["file-list"], enable_rubberband=True, reorderable=False)
+        self.column_view.connect("activate", self._on_activate)
+
+        name_column = Gtk.ColumnViewColumn(title="Name", factory=self._factory(self._setup_name_cell, self._bind_name_cell), expand=True, resizable=True)
+        name_column.set_sorter(Gtk.CustomSorter.new(lambda a, b, _d: self._order(a.node.name.casefold(), b.node.name.casefold()), None))
+        size_column = Gtk.ColumnViewColumn(title="Size", factory=self._factory(self._setup_label_cell, self._bind_size_cell), fixed_width=110)
+        size_column.set_sorter(Gtk.CustomSorter.new(lambda a, b, _d: self._order(a.node.size or 0, b.node.size or 0), None))
+        modified_column = Gtk.ColumnViewColumn(title="Modified", factory=self._factory(self._setup_label_cell, self._bind_modified_cell, xalign=1), fixed_width=170)
+        epoch = datetime.fromtimestamp(0).astimezone()
+        modified_column.set_sorter(Gtk.CustomSorter.new(lambda a, b, _d: self._order(a.node.modified or epoch, b.node.modified or epoch), None))
+        self.columns = {"name": name_column, "size": size_column, "modified": modified_column}
+        for column in self.columns.values():
+            self.column_view.append_column(column)
+
+        self.sorter.append(self.column_view.get_sorter())
+        self.column_view.get_sorter().connect("changed", lambda *_a: self._sync_sort_action())
+        self.column_view.sort_by_column(name_column, Gtk.SortType.ASCENDING)
+        return self.column_view
+
+    def _build_grid_view(self):
+        factory = self._factory(self._setup_grid_cell, self._bind_grid_cell)
+        self.grid_view = Gtk.GridView(model=self.selection, factory=factory, css_classes=["file-grid"], enable_rubberband=True, max_columns=12, min_columns=2)
+        self.grid_view.connect("activate", self._on_activate)
+        return self.grid_view
+
+    def _build_bottom_bar(self):
+        bar = Gtk.CenterBox(margin_start=6, margin_end=6, margin_top=4, margin_bottom=4)
+        nav = Gtk.Box(spacing=2)
+        nav.append(Gtk.Button(icon_name="go-previous-symbolic", action_name="win.back", css_classes=["flat"], tooltip_text="Back (Alt+Left)"))
+        nav.append(Gtk.Button(icon_name="go-next-symbolic", action_name="win.forward", css_classes=["flat"], tooltip_text="Forward (Alt+Right)"))
+        bar.set_start_widget(nav)
+
+        self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], ellipsize=Pango.EllipsizeMode.MIDDLE)
+        bar.set_center_widget(self.status_label)
+
+        view_box = Gtk.Box(spacing=2)
+        list_button = Gtk.ToggleButton(icon_name="view-list-symbolic", css_classes=["flat"], tooltip_text="List View (Ctrl+1)", action_name="win.view", action_target=GLib.Variant("s", "list"))
+        grid_button = Gtk.ToggleButton(icon_name="view-grid-symbolic", css_classes=["flat"], tooltip_text="Grid View (Ctrl+2)", action_name="win.view", action_target=GLib.Variant("s", "grid"))
+        sort_menu = Gio.Menu()
+        for label, target in (("A–Z", "name-asc"), ("Z–A", "name-desc"), ("Last Modified", "modified-desc"), ("First Modified", "modified-asc"), ("Size", "size-desc")):
+            sort_menu.append(label, f"win.sort::{target}")
+        view_box.append(list_button)
+        view_box.append(grid_button)
+        view_box.append(Gtk.MenuButton(icon_name="pan-down-symbolic", menu_model=sort_menu, css_classes=["flat"], tooltip_text="Sort"))
+        bar.set_end_widget(view_box)
+        return bar
+
+    # ------------------------------------------------------------ cells
+
+    def _factory(self, setup, bind, **kwargs):
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _f, list_item: setup(list_item, **kwargs))
+        factory.connect("bind", lambda _f, list_item: bind(list_item))
+        return factory
+
+    def _add_item_menu(self, widget, list_item):
+        click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        click.connect("pressed", self._on_item_menu, list_item)
+        widget.add_controller(click)
+
+    def _setup_name_cell(self, list_item):
+        box = Gtk.Box(spacing=12)
+        box.append(Gtk.Image(pixel_size=32))
+        box.append(Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE, hexpand=True))
+        self._add_item_menu(box, list_item)
+        list_item.set_child(box)
+
+    def _setup_label_cell(self, list_item, xalign=0):
+        label = Gtk.Label(xalign=xalign, css_classes=["dim-label"])
+        self._add_item_menu(label, list_item)
+        list_item.set_child(label)
+
+    def _setup_grid_cell(self, list_item):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, width_request=110)
+        box.append(Gtk.Image(pixel_size=64))
+        box.append(Gtk.Label(wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2, ellipsize=Pango.EllipsizeMode.END, justify=Gtk.Justification.CENTER, max_width_chars=14))
+        self._add_item_menu(box, list_item)
+        list_item.set_child(box)
+
+    def _is_cut(self, node):
+        return bool(self.cut_items) and any(n.uid == node.uid for n in self.cut_items[1])
+
+    def _bind_icon_and_name(self, list_item):
+        node = list_item.get_item().node
+        box = list_item.get_child()
+        image, label = box.get_first_child(), box.get_last_child()
+        image.set_from_gicon(node_icon(node))
+        label.set_label(node.name)
+        box.set_tooltip_text(node.name)
+        (box.add_css_class if self._is_cut(node) else box.remove_css_class)("cut-item")
+
+    def _bind_name_cell(self, list_item):
+        self._bind_icon_and_name(list_item)
+
+    def _bind_grid_cell(self, list_item):
+        self._bind_icon_and_name(list_item)
+
+    def _bind_size_cell(self, list_item):
+        node = list_item.get_item().node
+        list_item.get_child().set_label("—" if node.size is None else GLib.format_size(node.size))
+
+    def _bind_modified_cell(self, list_item):
+        node = list_item.get_item().node
+        label = list_item.get_child()
+        label.set_label(friendly_date(node.modified))
+        label.set_tooltip_text(node.modified.astimezone().strftime("%c") if node.modified else None)
+
+    # ------------------------------------------------------------ actions
+
+    def _build_actions(self):
+        simple = {
+            "back": self.go_back,
+            "forward": self.go_forward,
+            "up": self.go_up,
+            "refresh": self.refresh,
+            "location": self.start_location_entry,
+            "search": self.toggle_search,
+            "toggle-sidebar": lambda: self.sidebar_button.set_active(not self.sidebar_button.get_active()),
+            "select-all": lambda: self.selection.select_all(),
+            "open": self.open_selected,
+            "new-folder": self.new_folder,
+            "upload-files": lambda: self.upload_dialog(folders=False),
+            "upload-folders": lambda: self.upload_dialog(folders=True),
+            "download": self.download_selected,
+            "rename": self.rename_selected,
+            "cut": self.cut_selected,
+            "paste": self.paste,
+            "move-to": self.move_selected_to,
+            "trash": self.trash_selected,
+            "restore": self.restore_selected,
+            "delete": self.delete_selected,
+            "empty-trash": self.empty_trash,
+            "delete-key": lambda: self.delete_selected() if self.location.is_trash else self.trash_selected(),
+            "sign-in": self.sign_in,
+            "show-error": self.show_last_error,
+            "show-shortcuts": self.show_shortcuts,
+        }
+        for name, callback in simple.items():
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _a, _p, cb=callback: cb())
+            self.add_action(action)
+            self.actions[name] = action
+
+        view = Gio.SimpleAction.new_stateful("view", GLib.VariantType.new("s"), GLib.Variant("s", self.settings.get("view", "list")))
+        view.connect("change-state", self._on_view_changed)
+        self.add_action(view)
+        sort = Gio.SimpleAction.new_stateful("sort", GLib.VariantType.new("s"), GLib.Variant("s", "name-asc"))
+        sort.connect("change-state", self._on_sort_changed)
+        self.add_action(sort)
+        self.actions["sort"] = sort
+
+        self.folder_menu_button.set_menu_model(self._background_menu())
+
+    def _background_menu(self):
+        menu = Gio.Menu()
+        if self.location and self.location.is_trash:
+            menu.append("Empty Trash…", "win.empty-trash")
+        else:
+            create = Gio.Menu()
+            create.append("New Folder…", "win.new-folder")
+            create.append("Upload Files…", "win.upload-files")
+            create.append("Upload Folder…", "win.upload-folders")
+            menu.append_section(None, create)
+            paste = Gio.Menu()
+            paste.append("Paste", "win.paste")
+            paste.append("Select All", "win.select-all")
+            menu.append_section(None, paste)
+        tail = Gio.Menu()
+        tail.append("Refresh", "win.refresh")
+        menu.append_section(None, tail)
+        return menu
+
+    def _item_menu(self):
+        menu = Gio.Menu()
+        if self.location.is_trash:
+            menu.append("Restore From Trash", "win.restore")
+            menu.append("Delete Permanently…", "win.delete")
+            return menu
+        open_section = Gio.Menu()
+        open_section.append("Open", "win.open")
+        open_section.append("Download…", "win.download")
+        menu.append_section(None, open_section)
+        edit = Gio.Menu()
+        edit.append("Cut", "win.cut")
+        edit.append("Move To…", "win.move-to")
+        edit.append("Rename…", "win.rename")
+        menu.append_section(None, edit)
+        trash = Gio.Menu()
+        trash.append("Move to Trash…", "win.trash")
+        menu.append_section(None, trash)
+        return menu
+
+    def _enable(self, name, enabled):
+        self.actions[name].set_enabled(bool(enabled))
+
+    def _update_actions(self):
+        loc = self.location
+        nodes = self.selected_nodes() if loc else []
+        in_files = bool(loc) and not loc.is_trash
+        movable = in_files and bool(nodes) and loc.section in (cli.MY_FILES, cli.DEVICES, cli.SHARED_WITH_ME) and bool(loc.crumbs or loc.section == cli.MY_FILES)
+        self._enable("back", self.back_stack)
+        self._enable("forward", self.forward_stack)
+        self._enable("up", loc and loc.crumbs)
+        self._enable("new-folder", loc and loc.writable)
+        self._enable("upload-files", loc and loc.writable)
+        self._enable("upload-folders", loc and loc.writable)
+        self._enable("open", in_files and len(nodes) == 1)
+        self._enable("download", in_files and nodes)
+        self._enable("rename", in_files and len(nodes) == 1 and (loc.crumbs or loc.section == cli.MY_FILES))
+        self._enable("cut", movable)
+        self._enable("move-to", movable)
+        self._enable("paste", loc and loc.writable and self.cut_items)
+        self._enable("trash", movable)
+        self._enable("restore", loc and loc.is_trash and nodes)
+        self._enable("delete", loc and loc.is_trash and nodes)
+        self._enable("empty-trash", loc and loc.is_trash)
+
+    def _update_selection_state(self):
+        nodes = self.selected_nodes()
+        if not nodes:
+            text = ""
+        elif len(nodes) == 1:
+            size = f" ({GLib.format_size(nodes[0].size)})" if nodes[0].size is not None else ""
+            text = f"“{nodes[0].name}” selected{size}"
+        else:
+            text = f"{len(nodes)} items selected"
+        self.status_label.set_label(text)
+        self._update_actions()
+
+    # ------------------------------------------------------------ navigation
+
+    def navigate(self, location, record=True):
+        if record and self.location and location != self.location:
+            self.back_stack.append(self.location)
+            self.forward_stack.clear()
+        self.location = location
+        self._end_title_edit()
+        self._render_location()
+        self.folder_menu_button.set_menu_model(self._background_menu())
+        self.load()
+
+    def go_back(self):
+        if self.back_stack:
+            self.forward_stack.append(self.location)
+            self.navigate(self.back_stack.pop(), record=False)
+
+    def go_forward(self):
+        if self.forward_stack:
+            self.back_stack.append(self.location)
+            self.navigate(self.forward_stack.pop(), record=False)
+
+    def go_up(self):
+        if self.location and self.location.crumbs:
+            self.navigate(self.location.parent())
+
+    def refresh(self):
+        self.load()
+
+    def _render_location(self):
+        loc = self.location
+        self.set_title(f"{loc.title} – Proton Drive")
+        while child := self.crumbs_box.get_first_child():
+            self.crumbs_box.remove(child)
+
+        targets = [Location(loc.section, loc.crumbs[:i]) for i in range(len(loc.crumbs) + 1)]
+        hidden = max(0, len(targets) - 3)
+        if hidden:
+            self._add_crumb("…", targets[hidden - 1], current=False)
+        for target in targets[hidden:]:
+            if self.crumbs_box.get_first_child():
+                self.crumbs_box.append(Gtk.Label(label="/", css_classes=["crumb-separator"]))
+            self._add_crumb(target.title, target, current=target == loc, icon=None if target.crumbs else SECTION_ICONS[loc.section])
+
+        self.syncing_sidebar = True
+        row = next((r for r in self._sidebar_rows() if r.section == loc.section), None)
+        self.sidebar_list.select_row(row)
+        self.syncing_sidebar = False
+
+    def _add_crumb(self, title, target, current, icon=None):
+        content = Adw.ButtonContent(label=title, icon_name=icon) if icon else Gtk.Label(label=title, ellipsize=Pango.EllipsizeMode.END)
+        button = Gtk.Button(child=content, css_classes=["flat", "crumb"] + (["current"] if current else []))
+        button.connect("clicked", lambda _b: self.navigate(target) if target != self.location else self.start_location_entry())
+        self.crumbs_box.append(button)
+
+    def _sidebar_rows(self):
+        row = self.sidebar_list.get_first_child()
+        while row:
+            yield row
+            row = row.get_next_sibling()
+
+    def _on_sidebar_selected(self, _listbox, row):
+        if row is None or self.syncing_sidebar:
+            return
+        if self.location is None or row.section != self.location.section or self.location.crumbs:
+            self.navigate(Location(row.section))
+        if self.split.get_collapsed():
+            self.sidebar_button.set_active(False)
+
+    # ------------------------------------------------------------ loading
+
+    def load(self):
+        self.generation += 1
+        generation = self.generation
+        location = self.location
+        self.state_stack.set_visible_child_name("loading")
+
+        def worker():
+            try:
+                result, error = cli.list_folder(location.listing_path()), None
+            except cli.CliError as e:
+                result, error = None, e
+            GLib.idle_add(self._on_loaded, generation, result, error, priority=GLib.PRIORITY_DEFAULT)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_loaded(self, generation, nodes, error):
+        if generation != self.generation:
+            return
+        self.store.remove_all()
+        if error:
+            self._show_error_page(error)
+        else:
+            self.store.splice(0, 0, [Item(node) for node in nodes])
+            self._show_view_or_empty()
+        self._update_selection_state()
+
+    def _show_view_or_empty(self):
+        if self.filter_model.get_n_items():
+            self.state_stack.set_visible_child_name(self.lookup_action("view").get_state().get_string())
+            return
+        if self.search_text:
+            self._show_status("edit-find-symbolic", "No Results Found", "Try a different search. Search covers the current folder only.")
+        elif self.location.is_trash:
+            self._show_status("user-trash-symbolic", "Trash is Empty", "")
+        elif self.location.writable:
+            self._show_status("folder-symbolic", "Folder is Empty", "Drop files here to upload them.")
+        else:
+            self._show_status("folder-symbolic", "Folder is Empty", "")
+
+    def _show_status(self, icon, title, description, buttons=()):
+        self.status_page.set_icon_name(icon)
+        self.status_page.set_title(title)
+        self.status_page.set_description(description)
+        while child := self.status_buttons.get_first_child():
+            self.status_buttons.remove(child)
+        for label, callback, suggested in buttons:
+            button = Gtk.Button(label=label, css_classes=["pill"] + (["suggested-action"] if suggested else []))
+            button.connect("clicked", lambda _b, cb=callback: cb())
+            self.status_buttons.append(button)
+        self.state_stack.set_visible_child_name("status")
+
+    def _show_error_page(self, error):
+        self.last_error = ("Could Not Load Folder", error)
+        escaped = GLib.markup_escape_text(error.message)
+        if isinstance(error, cli.CliMissingError):
+            self._show_status("dialog-error-symbolic", "Proton Drive CLI Not Found", f"{escaped}\n{GLib.markup_escape_text(error.details)}", [("Try Again", self.refresh, True)])
+        elif isinstance(error, cli.AuthRequiredError):
+            buttons = [("Sign In…", self.sign_in, True)] if terminal_launcher() else []
+            self._show_status(
+                "dialog-password-symbolic",
+                "Sign In to Proton Drive",
+                f"The Proton Drive CLI is not signed in. Run <tt>{cli.CLI_NAME} auth login</tt> once; the CLI keeps the session in your keyring.",
+                buttons + [("Try Again", self.refresh, not buttons)],
+            )
+        else:
+            self._show_status("dialog-error-symbolic", "Could Not Load Folder", escaped, [("Try Again", self.refresh, True), ("Details", self.show_last_error, False)])
+
+    # ------------------------------------------------------------ title edit and search
+
+    def start_location_entry(self):
+        self.search_button.set_active(False)
+        self.path_entry.set_text(self.location.display_path())
+        self.title_stack.set_visible_child_name("entry")
+        self.path_entry.grab_focus()
+
+    def _on_path_entry_activate(self, entry):
+        location = parse_location(entry.get_text())
+        if location is None:
+            self.toast("Paths start with /my-files, /shared-with-me, /devices or /trash.")
+            return
+        if location.is_trash and location.crumbs:
+            self.toast("The CLI cannot open folders inside Trash.")
+            return
+        self.navigate(location)
+
+    def toggle_search(self):
+        self.search_button.set_active(not self.search_button.get_active())
+
+    def _on_search_toggled(self, button):
+        if button.get_active():
+            self.title_stack.set_visible_child_name("search")
+            self.search_entry.grab_focus()
+        else:
+            self.search_entry.set_text("")
+            if self.title_stack.get_visible_child_name() == "search":
+                self.title_stack.set_visible_child_name("pill")
+
+    def _end_title_edit(self):
+        self.search_button.set_active(False)
+        self.title_stack.set_visible_child_name("pill")
+
+    def _on_search_changed(self, entry):
+        self.search_text = entry.get_text().strip().casefold()
+        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+        if self.state_stack.get_visible_child_name() != "loading" and self.last_error_is_not_shown():
+            self._show_view_or_empty()
+
+    def last_error_is_not_shown(self):
+        return not (self.state_stack.get_visible_child_name() == "status" and self.status_page.get_icon_name() in ("dialog-error-symbolic", "dialog-password-symbolic"))
+
+    def _on_view_key(self, _controller, keyval, _keycode, state):
+        # Typing in the file view starts a search, as in Nautilus.
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        char = chr(Gdk.keyval_to_unicode(keyval)) if Gdk.keyval_to_unicode(keyval) else ""
+        if not char.isprintable() or char.isspace():
+            return False
+        self.search_button.set_active(True)
+        self.search_entry.set_text(self.search_entry.get_text() + char)
+        self.search_entry.set_position(-1)
+        return True
+
+    @staticmethod
+    def _add_escape(widget, callback):
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, keyval, *_a: (callback(), True)[1] if keyval == Gdk.KEY_Escape else False)
+        widget.add_controller(keys)
+
+    # ------------------------------------------------------------ view and sort
+
+    def _on_view_changed(self, action, value):
+        action.set_state(value)
+        self.settings["view"] = value.get_string()
+        save_settings(self.settings)
+        if self.state_stack.get_visible_child_name() in ("list", "grid"):
+            self.state_stack.set_visible_child_name(value.get_string())
+
+    def _on_sort_changed(self, action, value):
+        action.set_state(value)
+        key, direction = value.get_string().split("-")
+        sort_type = Gtk.SortType.ASCENDING if direction == "asc" else Gtk.SortType.DESCENDING
+        if self.column_view.get_sorter().get_primary_sort_column() != self.columns[key] or self.column_view.get_sorter().get_primary_sort_order() != sort_type:
+            self.column_view.sort_by_column(self.columns[key], sort_type)
+
+    def _sync_sort_action(self):
+        sorter = self.column_view.get_sorter()
+        column = sorter.get_primary_sort_column()
+        key = next((k for k, c in self.columns.items() if c == column), None)
+        if key and "sort" in self.actions:
+            direction = "asc" if sorter.get_primary_sort_order() == Gtk.SortType.ASCENDING else "desc"
+            self.actions["sort"].set_state(GLib.Variant("s", f"{key}-{direction}"))
+
+    # ------------------------------------------------------------ menus
+
+    def _popup(self, menu, widget, x, y):
+        ok, point = widget.compute_point(self.toasts, Graphene.Point().init(x, y))
+        if not ok:
+            return
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(point.x), int(point.y), 1, 1
+        self.context_menu.set_menu_model(menu)
+        self.context_menu.set_pointing_to(rect)
+        self.context_menu.popup()
+
+    def _on_item_menu(self, gesture, _n, x, y, list_item):
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        position = list_item.get_position()
+        if not self.selection.is_selected(position):
+            self.selection.select_item(position, True)
+        self._popup(self._item_menu(), gesture.get_widget(), x, y)
+
+    def _on_background_menu(self, gesture, _n, x, y, widget):
+        if self.state_stack.get_visible_child_name() not in ("list", "grid", "status"):
+            return
+        self.selection.unselect_all()
+        self._popup(self._background_menu(), widget, x, y)
+
+    def _on_activate(self, _view, position):
+        node = self.selection.get_item(position).node
+        if node.is_folder:
+            if self.location.is_trash:
+                self.toast("Restore the folder to open it.")
+            else:
+                self.navigate(self.location.child(node))
+        elif not self.location.is_trash:
+            self.open_file(node)
+
+    # ------------------------------------------------------------ operations
+
+    def run_operation(self, label, args, on_success=None, refresh=True, error_title=None, batch=False):
+        op = Operation(label)
+        self._add_operation_row(op)
+
+        def worker():
+            try:
+                op.process = cli.Process(args)
+                stdout, error = op.process.wait(), None
+            except cli.CliError as e:
+                stdout, error = None, e
+            GLib.idle_add(finish, stdout, error, priority=GLib.PRIORITY_DEFAULT)
+
+        def finish(stdout, error):
+            self._remove_operation_row(op)
+            if isinstance(error, cli.CancelledError):
+                self.toast(f"{label} cancelled")
+            elif error:
+                self.show_error(error_title or f"{label} Failed", error)
+            elif batch and (failures := cli.batch_failures(stdout)):
+                self.show_error(error_title or f"{label} Failed", cli.CliError(f"{count_label(len(failures))} failed.", "\n".join(failures)))
+            elif on_success:
+                on_success(stdout)
+            if refresh:
+                self.load()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _add_operation_row(self, op):
+        box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=12, margin_end=6)
+        box.append(Adw.Spinner())
+        box.append(Gtk.Label(label=op.label, xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
+        cancel = Gtk.Button(icon_name="process-stop-symbolic", css_classes=["flat", "circular"], tooltip_text="Cancel")
+        cancel.connect("clicked", lambda _b: op.process and op.process.cancel())
+        box.append(cancel)
+        op.row = Gtk.ListBoxRow(child=box, activatable=False)
+        self.ops_box.append(op.row)
+        self.operations.append(op)
+        self.ops_button.set_visible(True)
+
+    def _remove_operation_row(self, op):
+        self.ops_box.remove(op.row)
+        self.operations.remove(op)
+        self.ops_button.set_visible(bool(self.operations))
+        if not self.operations:
+            self.ops_button.set_active(False)
+
+    def _refs(self, nodes):
+        return [cli.item_ref(self.location.section, node) for node in nodes]
+
+    def open_selected(self):
+        nodes = self.selected_nodes()
+        if len(nodes) == 1:
+            self._on_activate(None, self.selection.get_selection().get_nth(0))
+
+    def open_file(self, node):
+        folder = os.path.join(OPEN_CACHE, hashlib.sha1(node.uid.encode()).hexdigest()[:16])
+        os.makedirs(folder, exist_ok=True)
+
+        def opened(_stdout):
+            path = os.path.join(folder, node.name)
+            target = path if os.path.exists(path) else folder
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(target), None)
+            self.toast(f"Opened a local copy of “{node.name}”. Changes are not uploaded.")
+
+        self.run_operation(f"Opening “{node.name}”", cli.open_download_args(cli.item_ref(self.location.section, node), folder), opened, refresh=False, error_title="Could Not Open File")
+
+    def download_selected(self):
+        nodes = self.selected_nodes()
+        if not nodes:
+            return
+        dialog = Gtk.FileDialog(title="Download To", accept_label="Download")
+        downloads = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+        if downloads:
+            dialog.set_initial_folder(Gio.File.new_for_path(downloads))
+        refs = self._refs(nodes)
+
+        def chosen(dialog, result):
+            try:
+                folder = dialog.select_folder_finish(result).get_path()
+            except GLib.Error:
+                return
+            self.run_operation(
+                f"Downloading {items_label(nodes)}",
+                cli.download_args(refs, folder),
+                lambda _out: self.toast(f"Downloaded {items_label(nodes)} to {os.path.basename(folder) or folder}", open_path=folder),
+                refresh=False,
+                error_title="Download Failed",
+            )
+
+        dialog.select_folder(self, None, chosen)
+
+    def upload_dialog(self, folders):
+        if not self.location.writable:
+            return
+        dialog = Gtk.FileDialog(title="Upload Folders" if folders else "Upload Files", accept_label="Upload")
+
+        def chosen(dialog, result):
+            try:
+                files = (dialog.select_multiple_folders_finish if folders else dialog.open_multiple_finish)(result)
+            except GLib.Error:
+                return
+            self.upload([files.get_item(i).get_path() for i in range(files.get_n_items())])
+
+        (dialog.select_multiple_folders if folders else dialog.open_multiple)(self, None, chosen)
+
+    def upload(self, paths):
+        paths = [p for p in paths if p]
+        if not paths or not self.location.writable:
+            return
+        label = f"“{os.path.basename(paths[0])}”" if len(paths) == 1 else count_label(len(paths))
+        target = self.location
+        self.run_operation(
+            f"Uploading {label}",
+            cli.upload_args(paths, target.listing_path()),
+            lambda _out: self.toast(f"Uploaded {label} to {target.title}"),
+            error_title="Upload Failed",
+        )
+
+    def _on_drop(self, _target, value, _x, _y):
+        if not self.location.writable:
+            self.toast("You cannot upload here.")
+            return False
+        self.upload([f.get_path() for f in value.get_files()])
+        return True
+
+    def new_folder(self):
+        if not self.location.writable:
+            return
+        location = self.location
+
+        def create(name):
+            self.run_operation(f"Creating “{name}”", cli.create_folder_args(location.listing_path(), name), error_title="Could Not Create Folder")
+
+        self.name_dialog("New Folder", "Folder name", "", "Create", create)
+
+    def rename_selected(self):
+        nodes = self.selected_nodes()
+        if len(nodes) != 1:
+            return
+        node = nodes[0]
+        ref = cli.item_ref(self.location.section, node)
+        stem_end = len(os.path.splitext(node.name)[0]) if not node.is_folder and not node.name.startswith(".") else len(node.name)
+
+        def rename(name):
+            if name != node.name:
+                self.run_operation(f"Renaming “{node.name}”", cli.rename_args(ref, name), error_title="Could Not Rename")
+
+        self.name_dialog(f"Rename {'Folder' if node.is_folder else 'File'}", "Name", node.name, "Rename", rename, select_to=stem_end)
+
+    def name_dialog(self, heading, field, initial, action_label, on_done, select_to=None):
+        dialog = Adw.AlertDialog(heading=heading)
+        row = Adw.EntryRow(title=field, text=initial, activates_default=True)
+        group = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        group.append(row)
+        hint = Gtk.Label(css_classes=["caption", "error"], xalign=0, visible=False, margin_top=6, wrap=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(group)
+        box.append(hint)
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("ok", action_label)
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("ok")
+        dialog.set_close_response("cancel")
+
+        def validate(*_a):
+            text = row.get_text()
+            ok = valid_name(text)
+            dialog.set_response_enabled("ok", ok)
+            hint.set_visible(bool(text.strip()) and not ok)
+            hint.set_label("Names cannot contain “/”, or be “.” or “..”.")
+
+        row.connect("changed", validate)
+        validate()
+        dialog.connect("response", lambda _d, response: response == "ok" and on_done(row.get_text().strip()))
+        dialog.present(self)
+        row.grab_focus()
+        if select_to is not None:
+            GLib.idle_add(lambda: row.select_region(0, select_to) and False)
+
+    def cut_selected(self):
+        nodes = self.selected_nodes()
+        if nodes:
+            self.cut_items = (self.location.section, nodes)
+            self.toast(f"{items_label(nodes)} ready to move. Open the target folder and paste.")
+            self._rebind()
+            self._update_actions()
+
+    def paste(self):
+        if not self.cut_items or not self.location.writable:
+            return
+        section, nodes = self.cut_items
+        self.cut_items = None
+        self._move([cli.item_ref(section, node) for node in nodes], nodes, self.location)
+
+    def move_selected_to(self):
+        nodes = self.selected_nodes()
+        if not nodes:
+            return
+        refs = self._refs(nodes)
+        MoveDialog(self.location, {n.uid for n in nodes}, lambda target: self._move(refs, nodes, target)).present(self)
+
+    def _move(self, refs, nodes, target):
+        self.run_operation(
+            f"Moving {items_label(nodes)}",
+            cli.move_args(refs, target.listing_path()),
+            lambda _out: self.toast(f"Moved {items_label(nodes)} to {target.title}"),
+            error_title="Move Failed",
+            batch=True,
+        )
+
+    def _rebind(self):
+        # Redraw rows so the cut state shows; the store keeps the same items.
+        count = self.store.get_n_items()
+        self.store.items_changed(0, count, count)
+
+    def confirm(self, heading, body, action_label, on_confirm):
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("ok", action_label)
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, response: response == "ok" and on_confirm())
+        dialog.present(self)
+
+    def trash_selected(self):
+        nodes = self.selected_nodes()
+        if not nodes or self.location.is_trash:
+            return
+        refs = self._refs(nodes)
+        self.confirm(
+            f"Move {items_label(nodes)} to Trash?",
+            "You can restore items from Trash until you empty it.",
+            "Move to Trash",
+            lambda: self.run_operation(f"Moving {items_label(nodes)} to Trash", cli.trash_args(refs), lambda _o: self.toast(f"Moved {items_label(nodes)} to Trash"), error_title="Could Not Move to Trash", batch=True),
+        )
+
+    def restore_selected(self):
+        nodes = self.selected_nodes()
+        if nodes and self.location.is_trash:
+            self.run_operation(f"Restoring {items_label(nodes)}", cli.restore_args(self._refs(nodes)), lambda _o: self.toast(f"Restored {items_label(nodes)}"), error_title="Restore Failed", batch=True)
+
+    def delete_selected(self):
+        nodes = self.selected_nodes()
+        if not nodes or not self.location.is_trash:
+            return
+        refs = self._refs(nodes)
+        self.confirm(
+            f"Permanently Delete {items_label(nodes)}?",
+            "Deleted items cannot be restored.",
+            "Delete",
+            lambda: self.run_operation(f"Deleting {items_label(nodes)}", cli.delete_args(refs), lambda _o: self.toast(f"Deleted {items_label(nodes)}"), error_title="Delete Failed", batch=True),
+        )
+
+    def empty_trash(self):
+        self.confirm(
+            "Empty Trash?",
+            "All items in Proton Drive Trash will be permanently deleted. Photos trash is not affected.",
+            "Empty Trash",
+            lambda: self.run_operation("Emptying Trash", cli.empty_trash_args(), lambda _o: self.toast("Trash emptied. Proton finishes this in the background."), error_title="Could Not Empty Trash"),
+        )
+
+    def sign_in(self):
+        launcher, binary = terminal_launcher(), cli.find_cli()
+        if not binary:
+            self.show_error("Sign In", cli.CliMissingError(f"The Proton Drive CLI ({cli.CLI_NAME}) was not found.", f"Install it to ~/.local/bin/{cli.CLI_NAME}."))
+            return
+        if not launcher:
+            self.show_error("Sign In", cli.CliError("No terminal launcher found.", f"Run this in a terminal:\n{binary} auth login"))
+            return
+        subprocess.Popen([launcher, binary, "auth", "login"], start_new_session=True)
+        self.toast("Finish signing in, then press F5 to refresh.")
+
+    # ------------------------------------------------------------ feedback
+
+    def toast(self, title, open_path=None):
+        toast = Adw.Toast(title=GLib.markup_escape_text(title), timeout=4)
+        if open_path:
+            toast.set_button_label("Open Folder")
+            toast.connect("button-clicked", lambda _t: Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(open_path), None))
+        self.toasts.add_toast(toast)
+
+    def show_error(self, title, error):
+        self.last_error = (title, error)
+        if isinstance(error, cli.AuthRequiredError):
+            body = f"{error.message} Run “{cli.CLI_NAME} auth login”, or use Sign In… in the main menu."
+        else:
+            body = error.message
+        dialog = Adw.AlertDialog(heading=title, body=body)
+        if error.details and error.details != error.message:
+            text = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8, left_margin=8, right_margin=8)
+            text.get_buffer().set_text(error.details)
+            scrolled = Gtk.ScrolledWindow(child=text, min_content_height=120, max_content_height=260, propagate_natural_height=True, css_classes=["card"])
+            dialog.set_extra_child(Gtk.Expander(label="Details from the CLI", child=scrolled))
+            dialog.add_response("copy", "Copy Details")
+        dialog.add_response("close", "Close")
+        dialog.set_default_response("close")
+        dialog.set_close_response("close")
+
+        def response(_d, response_id):
+            if response_id == "copy":
+                provider = Gdk.ContentProvider.new_for_bytes("text/plain;charset=utf-8", GLib.Bytes.new(f"{body}\n\n{error.details}".encode()))
+                self.get_clipboard().set_content(provider)
+
+        dialog.connect("response", response)
+        dialog.present(self)
+
+    def show_last_error(self):
+        if self.last_error:
+            self.show_error(*self.last_error)
+
+    def show_shortcuts(self):
+        rows = [
+            ("Open", "Enter / double-click"), ("Back / Forward", "Alt+Left / Alt+Right"), ("Parent folder", "Alt+Up"),
+            ("Type a path", "Ctrl+L"), ("Search this folder", "Ctrl+F, or start typing"), ("Refresh", "F5 / Ctrl+R"),
+            ("New folder", "Ctrl+Shift+N"), ("Upload files", "Ctrl+U"), ("Download", "Ctrl+Shift+D"), ("Rename", "F2"),
+            ("Cut / Paste (move)", "Ctrl+X / Ctrl+V"), ("Move to Trash", "Delete"), ("Delete permanently (in Trash)", "Delete"),
+            ("Select all", "Ctrl+A"), ("List / Grid view", "Ctrl+1 / Ctrl+2"), ("Sidebar", "F9"),
+        ]
+        dialog = Adw.AlertDialog(heading="Keyboard Shortcuts")
+        grid = Gtk.Grid(column_spacing=24, row_spacing=6)
+        for i, (what, keys) in enumerate(rows):
+            grid.attach(Gtk.Label(label=what, xalign=0), 0, i, 1, 1)
+            grid.attach(Gtk.Label(label=keys, xalign=0, css_classes=["dim-label"]), 1, i, 1, 1)
+        dialog.set_extra_child(grid)
+        dialog.add_response("close", "Close")
+        dialog.present(self)
+
+    def _on_close_request(self, _window):
+        if not self.operations:
+            return False
+
+        def stop():
+            for op in list(self.operations):
+                if op.process:
+                    op.process.cancel()
+            self.destroy()
+
+        self.confirm("Stop Transfers?", f"{count_label(len(self.operations), 'operation')} still running. Closing stops them, and some items may be left half done.", "Stop and Close", stop)
+        return True
+
+
+class DriveApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        accels = {
+            "win.back": ["<Alt>Left", "Back"],
+            "win.forward": ["<Alt>Right", "Forward"],
+            "win.up": ["<Alt>Up"],
+            "win.refresh": ["F5", "<Control>r"],
+            "win.location": ["<Control>l"],
+            "win.search": ["<Control>f"],
+            "win.toggle-sidebar": ["F9"],
+            "win.select-all": ["<Control>a"],
+            "win.new-folder": ["<Control><Shift>n"],
+            "win.upload-files": ["<Control>u"],
+            "win.download": ["<Control><Shift>d"],
+            "win.rename": ["F2"],
+            "win.cut": ["<Control>x"],
+            "win.paste": ["<Control>v"],
+            "win.delete-key": ["Delete", "KP_Delete", "<Shift>Delete"],
+            "win.view::list": ["<Control>1"],
+            "win.view::grid": ["<Control>2"],
+            "win.show-shortcuts": ["<Control>question"],
+        }
+        for action, keys in accels.items():
+            self.set_accels_for_action(action, keys)
+
+    def do_activate(self):
+        window = self.get_active_window() or DriveWindow(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    sys.exit(DriveApp().run(sys.argv))

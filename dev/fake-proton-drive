@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Test stand-in for the Proton Drive CLI. NOT the real CLI.
+
+It copies the real CLI's arguments and output shapes (v0.9.0 source) over a
+local folder ($FAKE_DRIVE_ROOT), so the GUI can be exercised without an
+account. Set FAKE_LOGGED_OUT=1 to get the "not signed in" error, and
+FAKE_FAIL=<command> to make that command fail.
+"""
+
+import base64
+import json
+import os
+import shutil
+import sys
+from datetime import datetime, timezone
+
+ROOT = os.environ.get("FAKE_DRIVE_ROOT", os.path.expanduser("~/.cache/fake-proton-drive"))
+SECTIONS = ("my-files", "shared-with-me", "devices", "trash")
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+def uid_for(abs_path):
+    rel = os.path.relpath(abs_path, ROOT).encode()
+    return "U" * 22 + "~" + base64.urlsafe_b64encode(rel).decode().rstrip("=")
+
+
+def path_for_uid(uid):
+    encoded = uid.split("~", 1)[1]
+    return os.path.join(ROOT, base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+
+
+def split(path):
+    parts, current, i = [], "", 0
+    while i < len(path):
+        if path[i] == "\\" and i + 1 < len(path) and path[i + 1] == "/":
+            current += "/"
+            i += 2
+            continue
+        if path[i] == "/":
+            parts.append(current)
+            current = ""
+        else:
+            current += path[i]
+        i += 1
+    parts.append(current)
+    return [p for p in parts if p]
+
+
+def resolve(path):
+    parts = split(path)
+    if not parts or parts[0] not in SECTIONS:
+        fail(f"Invalid path: {path}")
+    node = os.path.join(ROOT, parts[0])
+    for part in parts[1:]:
+        if part.startswith("U" * 22 + "~"):
+            node = path_for_uid(part)
+        else:
+            node = os.path.join(node, part)
+        if not os.path.exists(node):
+            fail(f"Node not found: {part}")
+    return node
+
+
+def to_json(abs_path):
+    stat = os.stat(abs_path)
+    mtime = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+    is_dir = os.path.isdir(abs_path)
+    node = {
+        "uid": uid_for(abs_path),
+        "name": {"ok": True, "value": os.path.basename(abs_path)},
+        "type": "folder" if is_dir else "file",
+        "isShared": False,
+        "creationTime": mtime,
+        "modificationTime": mtime,
+    }
+    if not is_dir:
+        node["mediaType"] = "application/octet-stream" if abs_path.endswith(".bin") else None
+        node["activeRevision"] = {"claimedSize": stat.st_size, "claimedModificationTime": mtime}
+    return node
+
+
+def print_iterable(items):
+    print("[\n" + ",\n".join(json.dumps(i) for i in items) + "\n]")
+
+
+def available(target):
+    base, ext = os.path.splitext(target)
+    n = 1
+    while os.path.exists(target):
+        target = f"{base} ({n}){ext}"
+        n += 1
+    return target
+
+
+def copy_in(src, parent, file_strategy):
+    target = os.path.join(parent, os.path.basename(src.rstrip("/")))
+    if os.path.isdir(src):
+        os.makedirs(target, exist_ok=True)
+        for child in os.listdir(src):
+            copy_in(os.path.join(src, child), target, file_strategy)
+    else:
+        if os.path.exists(target) and file_strategy == "rename":
+            target = available(target)
+        shutil.copy2(src, target)
+
+
+def main():
+    argv = sys.argv[1:]
+    for section in SECTIONS:
+        os.makedirs(os.path.join(ROOT, section), exist_ok=True)
+    if len(argv) < 2:
+        fail("Usage: fake-proton-drive <group> <command> ...")
+    group, command, rest = argv[0], argv[1], argv[2:]
+    opts, args, i = {}, [], 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--":
+            args += rest[i + 1:]
+            break
+        if arg in ("--json", "-j"):
+            opts["json"] = True
+        elif arg in ("-f", "-d", "-t", "--type"):
+            opts[arg] = rest[i + 1]
+            i += 1
+        elif arg.startswith("-"):
+            fail(f"Unknown option '{arg}'")
+        else:
+            args.append(arg)
+        i += 1
+
+    if os.environ.get("FAKE_LOGGED_OUT"):
+        fail("You need to login first")
+    if os.environ.get("FAKE_FAIL") == command:
+        fail(f"Simulated failure for {command}: the server rejected the request")
+    if group != "filesystem":
+        fail(f"Command not found: {group} {command}")
+
+    if command == "list":
+        if args[0] == "/devices":
+            print_iterable([])
+            return
+        folder = resolve(args[0])
+        children = sorted(os.listdir(folder))
+        nodes = [to_json(os.path.join(folder, c)) for c in children]
+        if opts.get("--type") == "folder":
+            nodes = [n for n in nodes if n["type"] == "folder"]
+        print_iterable(nodes)
+    elif command == "upload":
+        parent = resolve(args[-1])
+        for src in args[:-1]:
+            if not os.path.exists(src):
+                fail(f"Local path not found: {src}")
+            copy_in(src, parent, opts.get("-f"))
+        print(json.dumps({"uploaded": len(args) - 1}))
+    elif command == "download":
+        local = args[-1]
+        os.makedirs(local, exist_ok=True)
+        for ref in args[:-1]:
+            copy_in(resolve(ref), local, opts.get("-f"))
+        print(json.dumps({"downloaded": len(args) - 1}))
+    elif command == "create-folder":
+        target = os.path.join(resolve(args[0]), args[1])
+        if os.path.exists(target):
+            fail(f"A file or folder with the name \"{args[1]}\" already exists")
+        os.mkdir(target)
+        print(json.dumps(to_json(target)))
+    elif command == "rename":
+        src = resolve(args[0])
+        target = os.path.join(os.path.dirname(src), args[1])
+        if os.path.exists(target):
+            fail(f"A file or folder with the name \"{args[1]}\" already exists")
+        os.rename(src, target)
+        print(json.dumps(to_json(target)))
+    elif command in ("move", "trash", "restore", "delete"):
+        refs = args[:-1] if command == "move" else args
+        target = resolve(args[-1]) if command == "move" else None
+        for ref in refs:
+            src = resolve(ref)
+            name = os.path.basename(src)
+            if os.environ.get("FAKE_FAIL_ITEM") == name:
+                print(f"❌ {name}: Simulated per-item failure")
+                continue
+            if command == "move":
+                if os.path.realpath(target).startswith(os.path.realpath(src) + os.sep) or os.path.realpath(target) == os.path.realpath(src):
+                    print(f"❌ {name}: Cannot move a folder into itself")
+                    continue
+                shutil.move(src, available(os.path.join(target, name)))
+            elif command == "trash":
+                shutil.move(src, available(os.path.join(ROOT, "trash", name)))
+            elif command == "restore":
+                shutil.move(src, available(os.path.join(ROOT, "my-files", name)))
+            else:
+                shutil.rmtree(src) if os.path.isdir(src) else os.remove(src)
+            print(f"✅ {name}")
+    elif command == "empty-trash":
+        trash = os.path.join(ROOT, "trash")
+        shutil.rmtree(trash)
+        os.mkdir(trash)
+        print("✅ Trash emptied")
+    else:
+        fail(f"Command not found: {group} {command}")
+
+
+if __name__ == "__main__":
+    main()
